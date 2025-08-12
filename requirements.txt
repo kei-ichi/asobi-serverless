@@ -1,0 +1,2 @@
+# AWS official Python SDK
+boto3

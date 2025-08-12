@@ -537,7 +537,7 @@ ROUTE_HANDLERS = {
 }
 
 
-def lambda_handler(event: Dict, context: Any) -> Dict:
+def handler(event: Dict, context: Any) -> Dict:
     """
     Main Lambda handler with functional routing
     Processes API Gateway events and routes to appropriate handlers
