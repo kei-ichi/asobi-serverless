@@ -217,6 +217,61 @@ def query_room_device_specific(room_id: str, device_id: str, start_time: Optiona
         raise Exception(f"Room-device query failed: {str(e)}")
 
 
+def query_device_room_info(device_id: str) -> List[str]:
+    """
+    Get all unique room IDs where a specific device has been deployed
+    Uses device partition key query with room_id projection
+    """
+    try:
+        response = table.query(
+            KeyConditionExpression=Key('device_id').eq(device_id),
+            ProjectionExpression='room_id'  # Only fetch room_id attribute
+        )
+        # Extract unique room IDs for this device
+        rooms = set(item['room_id'] for item in response.get('Items', []))
+        return sorted(list(rooms))
+    except Exception as e:
+        raise Exception(f"Device room query failed: {str(e)}")
+
+
+def query_device_in_specific_room(device_id: str, room_id: str, start_time: Optional[str] = None,
+                                  end_time: Optional[str] = None, status: Optional[str] = None) -> List[Dict]:
+    """
+    Query specific device in specific room - optimized version using device partition key
+    More efficient than GSI approach for device-centric queries
+    """
+    try:
+        # Use device partition key for optimal performance
+        key_condition = Key('device_id').eq(device_id)
+
+        # Add timestamp filtering
+        if start_time and end_time:
+            key_condition = key_condition & Key('timestamp').between(start_time, end_time)
+        elif start_time:
+            key_condition = key_condition & Key('timestamp').gte(start_time)
+        elif end_time:
+            key_condition = key_condition & Key('timestamp').lte(end_time)
+
+        # Prepare query parameters
+        query_params = {'KeyConditionExpression': key_condition}
+
+        # Build filter expression for room_id and optional status
+        filter_expressions = [Attr('room_id').eq(room_id)]
+        if status:
+            filter_expressions.append(Attr('device_status').eq(status))
+
+        # Combine filter expressions with AND logic
+        if len(filter_expressions) == 1:
+            query_params['FilterExpression'] = filter_expressions[0]
+        else:
+            query_params['FilterExpression'] = filter_expressions[0] & filter_expressions[1]
+
+        response = table.query(**query_params)
+        return response.get('Items', [])
+    except Exception as e:
+        raise Exception(f"Device-room query failed: {str(e)}")
+
+
 def get_unique_rooms() -> List[str]:
     """
     Scan table to get all unique room IDs
@@ -392,6 +447,86 @@ def handle_device_detail(event: Dict) -> Dict:
         return create_error_response(500, f"Failed to retrieve device data: {str(e)}")
 
 
+def handle_device_rooms(event: Dict) -> Dict:
+    """
+    Handle GET /devices/{device_id}/rooms - return all rooms where device has been deployed
+    Provides room deployment history for a specific device
+    """
+    path_params = extract_path_params(event)
+    device_id = path_params.get('device_id')
+
+    # Validate required path parameter
+    validators = {'device_id': validate_device_id}
+    is_valid, errors = validate_params({'device_id': device_id}, validators)
+
+    if not is_valid:
+        return create_error_response(400, "Validation failed", errors)
+
+    try:
+        # Get all rooms where this device has been deployed
+        rooms = query_device_room_info(device_id)
+        return create_response(200, {
+            'device_id': device_id,
+            'rooms': rooms,
+            'count': len(rooms)
+        })
+    except Exception as e:
+        return create_error_response(500, f"Failed to retrieve device rooms: {str(e)}")
+
+
+def handle_device_room_detail(event: Dict) -> Dict:
+    """
+    Handle GET /devices/{device_id}/{room_id} - return specific device data in specific room
+    Device-centric approach for querying device performance in specific room
+    """
+    # Extract parameters from API Gateway event
+    path_params = extract_path_params(event)
+    query_params = extract_query_params(event)
+
+    device_id = path_params.get('device_id')
+    room_id = path_params.get('room_id')
+
+    # Validate required path parameters
+    validators = {
+        'device_id': validate_device_id,
+        'room_id': validate_room_id
+    }
+    is_valid, errors = validate_params({'device_id': device_id, 'room_id': room_id}, validators)
+
+    if not is_valid:
+        return create_error_response(400, "Validation failed", errors)
+
+    # Extract optional query parameters
+    start_time = query_params.get('start_time')
+    end_time = query_params.get('end_time')
+    status = query_params.get('status')
+
+    # Validate optional query parameters
+    optional_validators = {
+        'start_time': validate_timestamp,
+        'end_time': validate_timestamp,
+        'status': validate_status
+    }
+
+    optional_params = {k: v for k, v in query_params.items() if v is not None}
+    is_valid, errors = validate_params(optional_params, optional_validators)
+
+    if not is_valid:
+        return create_error_response(400, "Query parameter validation failed", errors)
+
+    try:
+        # Execute device-room specific query (optimized for device partition key)
+        data = query_device_in_specific_room(device_id, room_id, start_time, end_time, status)
+        return create_response(200, {
+            'device_id': device_id,
+            'room_id': room_id,
+            'data': data,
+            'count': len(data)
+        })
+    except Exception as e:
+        return create_error_response(500, f"Failed to retrieve device-room data: {str(e)}")
+
+
 def handle_rooms_list(event: Dict) -> Dict:
     """
     Handle GET /rooms - return list of all unique room IDs
@@ -472,7 +607,7 @@ def handle_room_devices(event: Dict) -> Dict:
 def handle_room_device_detail(event: Dict) -> Dict:
     """
     Handle GET /rooms/{room_id}/{device_id} - return specific device data in specific room
-    Combines room and device filtering for precise queries
+    Room-centric approach for querying device performance in room context
     """
     # Extract parameters from API Gateway event
     path_params = extract_path_params(event)
@@ -510,7 +645,7 @@ def handle_room_device_detail(event: Dict) -> Dict:
         return create_error_response(400, "Query parameter validation failed", errors)
 
     try:
-        # Execute room-device specific query
+        # Execute room-device specific query using GSI approach
         data = query_room_device_specific(room_id, device_id, start_time, end_time, status)
         return create_response(200, {
             'room_id': room_id,
@@ -530,10 +665,12 @@ ROUTE_HANDLERS = {
     ('GET', '/'): handle_root,
     ('GET', '/devices'): handle_devices_list,
     ('GET', '/devices/{device_id}'): handle_device_detail,
+    ('GET', '/devices/{device_id}/rooms'): handle_device_rooms,  # NEW: Device room list
+    ('GET', '/devices/{device_id}/{room_id}'): handle_device_room_detail,  # NEW: Device-centric room query
     ('GET', '/rooms'): handle_rooms_list,
     ('GET', '/rooms/{room_id}'): handle_room_detail,
     ('GET', '/rooms/{room_id}/devices'): handle_room_devices,
-    ('GET', '/rooms/{room_id}/{device_id}'): handle_room_device_detail,  # New endpoint
+    ('GET', '/rooms/{room_id}/{device_id}'): handle_room_device_detail,  # Room-centric device query
 }
 
 
@@ -549,14 +686,14 @@ def handler(event: Dict, context: Any) -> Dict:
 
         # Route resolution using tuple key lookup
         route_key = (http_method, resource_path)
-        handler = ROUTE_HANDLERS.get(route_key)
+        route_handler = ROUTE_HANDLERS.get(route_key)
 
         # Handle unknown routes
-        if not handler:
+        if not route_handler:
             return create_error_response(404, f"Route not found: {http_method} {resource_path}")
 
         # Execute appropriate handler function
-        return handler(event)
+        return route_handler(event)
 
     except Exception as e:
         # Catch-all error handler for unexpected failures
