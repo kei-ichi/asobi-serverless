@@ -11,7 +11,7 @@ from typing import List, Dict, Any
 DYNAMODB_TABLE_NAME = "IoTTelemetryTable"
 
 # データ生成設定
-NUM_SENSORS = 100
+NUM_SENSORS = 200
 NUM_ROOMS = 10
 SENSORS_PER_ROOM = 20
 DATA_POINTS_PER_ROOM = 1000
@@ -426,7 +426,7 @@ if __name__ == "__main__":
 
         print(f"\nDynamoDBへのインポートコマンド:")
         print(
-            f"aws dynamodb batch-write-item --request-items file://{OUTPUT_FILES['batch_write_format']} --region us-east-1")
+            f"aws dynamodb batch-write-item --request-items file://{OUTPUT_FILES['batch_write_format']} --region ap-northeast-1")
 
     except Exception as e:
         print(f"ERROR: エラーが発生しました: {str(e)}")
