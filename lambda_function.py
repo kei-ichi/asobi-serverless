@@ -8,7 +8,7 @@ import re
 from decimal import Decimal
 from boto3.dynamodb.conditions import Key, Attr
 
-# Initialize DynamoDB resource with environment variable for flexible deployment
+# 環境変数からDynamoDBテーブル名を取得
 TABLE_NAME = os.environ.get('DYNAMODB_TABLE')
 if not TABLE_NAME:
     raise ValueError("DYNAMODB_TABLE environment variable is required")
@@ -16,28 +16,25 @@ if not TABLE_NAME:
 dynamodb = boto3.resource('dynamodb')
 table = dynamodb.Table(TABLE_NAME)
 
-# GSI name constant - matches DynamoDB secondary index configuration
+# GSI名 - room_idをパーティションキー、timestampをソートキーとするインデックス
 GSI_NAME = "room_id-timestamp-index"
 
 
 # ============================================================================
-# PURE VALIDATION FUNCTIONS - No side effects, deterministic output
+# バリデーション関数
 # ============================================================================
 
 def validate_device_id(device_id: str) -> bool:
     """
-    Validate device_id format: device_type_number where number > 0
-    Examples: fridge_01, sensor_42, thermostat_5
+    デバイスID形式の検証: device_type_number（numberは0より大きい）
+    例: fridge_01, sensor_42, thermostat_5
     """
-    # Check basic type and underscore count
     if not isinstance(device_id, str) or device_id.count('_') != 1:
         return False
 
-    # Split into device type and numeric ID
     device_type, device_num = device_id.split('_')
 
     try:
-        # Validate numeric part is positive integer
         num = int(device_num)
         return isinstance(device_type, str) and len(device_type) > 0 and num > 0
     except ValueError:
@@ -45,16 +42,42 @@ def validate_device_id(device_id: str) -> bool:
 
 
 def validate_room_id(room_id: str) -> bool:
-    """Validate room_id is non-empty string"""
-    return isinstance(room_id, str) and len(room_id.strip()) > 0
+    """
+    部屋ID形式の検証: room_number（numberは0より大きい3桁の数字）
+    例: room_001, room_002, room_010, room_100
+    """
+    if not isinstance(room_id, str) or room_id.count('_') != 1:
+        return False
+
+    room_prefix, room_num = room_id.split('_')
+
+    try:
+        # プレフィックスが'room'であることを確認
+        if room_prefix != 'room':
+            return False
+
+        # 数値部分が正の整数であることを検証
+        num = int(room_num)
+
+        # 数値が0より大きく、3桁の形式（001, 002など）であることを確認
+        return num > 0 and len(room_num) == 3 and room_num.isdigit()
+    except ValueError:
+        return False
 
 
 def validate_timestamp(timestamp: str) -> bool:
-    """Validate ISO timestamp format (e.g., 2024-12-01T10:00:00Z)"""
+    """
+    UTC形式タイムスタンプを検証: YYYY-MM-DDTHH:MM:SSZ（Z必須）
+    テストデータ形式に合わせてUTCのみ許可
+    """
     if not isinstance(timestamp, str):
         return False
+
+    # UTC（Z）で終わることを必須とする
+    if not timestamp.endswith('Z'):
+        return False
+
     try:
-        # Parse ISO format with timezone handling
         datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
         return True
     except (ValueError, TypeError):
@@ -62,37 +85,38 @@ def validate_timestamp(timestamp: str) -> bool:
 
 
 def validate_status(status: str) -> bool:
-    """Validate device status against allowed values"""
+    """
+    厳密な小文字ステータス値のみを許可
+    許可値: 'ok', 'sensor_error', 'offline', 'maintenance'
+    """
     valid_statuses = {'ok', 'sensor_error', 'offline', 'maintenance'}
-    return isinstance(status, str) and status.lower() in valid_statuses
-
+    return isinstance(status, str) and status in valid_statuses
 
 # ============================================================================
-# PARAMETER EXTRACTION FUNCTIONS - Pure functions for event parsing
+# パラメータ抽出関数
 # ============================================================================
 
 def extract_query_params(event: Dict[str, Any]) -> Dict[str, str]:
-    """Extract query parameters from API Gateway event, return empty dict if none"""
+    """API Gatewayイベントからクエリパラメータを抽出"""
     return event.get('queryStringParameters') or {}
 
 
 def extract_path_params(event: Dict[str, Any]) -> Dict[str, str]:
-    """Extract path parameters from API Gateway event, return empty dict if none"""
+    """API Gatewayイベントからパスパラメータを抽出"""
     return event.get('pathParameters') or {}
 
 
 # ============================================================================
-# VALIDATION PIPELINE - Functional composition for parameter validation
+# バリデーションパイプライン
 # ============================================================================
 
 def validate_params(params: Dict[str, Any], validators: Dict[str, callable]) -> Tuple[bool, List[str]]:
     """
-    Validate parameters using provided validator functions
-    Returns: (is_valid: bool, errors: List[str])
+    複数パラメータを一括検証
+    Returns: (検証成功フラグ, エラーメッセージリスト)
     """
     errors = []
 
-    # Apply each validator to corresponding parameter
     for param, value in params.items():
         if param in validators and value is not None:
             if not validators[param](value):
@@ -102,13 +126,12 @@ def validate_params(params: Dict[str, Any], validators: Dict[str, callable]) -> 
 
 
 # ============================================================================
-# DYNAMODB QUERY FUNCTIONS - Database interaction layer
+# DynamoDBクエリ関数
 # ============================================================================
 
 def query_all_devices() -> List[Dict]:
     """
-    Scan entire table to retrieve all device records
-    WARNING: Expensive operation for large tables
+    テーブル全体をスキャン - 大きなテーブルでは高コスト
     """
     try:
         response = table.scan()
@@ -120,14 +143,12 @@ def query_all_devices() -> List[Dict]:
 def query_device_by_id(device_id: str, start_time: Optional[str] = None,
                        end_time: Optional[str] = None, status: Optional[str] = None) -> List[Dict]:
     """
-    Query specific device using partition key with optional filters
-    Uses primary table index for optimal performance
+    device_id（パーティションキー）でクエリ、timestampとstatusでフィルタ
     """
     try:
-        # Build key condition for device_id (partition key)
         key_condition = Key('device_id').eq(device_id)
 
-        # Add timestamp range filtering using sort key
+        # timestampはソートキーなのでKeyConditionExpressionで効率的にフィルタ
         if start_time and end_time:
             key_condition = key_condition & Key('timestamp').between(start_time, end_time)
         elif start_time:
@@ -135,10 +156,9 @@ def query_device_by_id(device_id: str, start_time: Optional[str] = None,
         elif end_time:
             key_condition = key_condition & Key('timestamp').lte(end_time)
 
-        # Prepare query parameters
         query_params = {'KeyConditionExpression': key_condition}
 
-        # Add status filter as FilterExpression (applied after key condition)
+        # statusはFilterExpressionで後からフィルタ（キー条件後に適用）
         if status:
             query_params['FilterExpression'] = Attr('device_status').eq(status)
 
@@ -151,14 +171,12 @@ def query_device_by_id(device_id: str, start_time: Optional[str] = None,
 def query_room_by_id(room_id: str, start_time: Optional[str] = None,
                      end_time: Optional[str] = None) -> List[Dict]:
     """
-    Query room data using Global Secondary Index
-    Efficient for room-based queries across all devices
+    GSIを使用してroom_idでクエリ - 部屋内の全デバイスデータを取得
     """
     try:
-        # Build key condition for room_id (GSI partition key)
         key_condition = Key('room_id').eq(room_id)
 
-        # Add timestamp filtering using GSI sort key
+        # GSIのソートキー（timestamp）でフィルタ
         if start_time and end_time:
             key_condition = key_condition & Key('timestamp').between(start_time, end_time)
         elif start_time:
@@ -166,7 +184,6 @@ def query_room_by_id(room_id: str, start_time: Optional[str] = None,
         elif end_time:
             key_condition = key_condition & Key('timestamp').lte(end_time)
 
-        # Query using GSI
         response = table.query(
             IndexName=GSI_NAME,
             KeyConditionExpression=key_condition
@@ -179,14 +196,11 @@ def query_room_by_id(room_id: str, start_time: Optional[str] = None,
 def query_room_device_specific(room_id: str, device_id: str, start_time: Optional[str] = None,
                                end_time: Optional[str] = None, status: Optional[str] = None) -> List[Dict]:
     """
-    Query specific device in specific room with optional filters
-    Uses GSI for room filtering, then applies device filter
+    GSIでroom_idクエリ後、device_idとstatusでフィルタ
     """
     try:
-        # Start with room-based query using GSI
         key_condition = Key('room_id').eq(room_id)
 
-        # Add timestamp filtering
         if start_time and end_time:
             key_condition = key_condition & Key('timestamp').between(start_time, end_time)
         elif start_time:
@@ -194,18 +208,16 @@ def query_room_device_specific(room_id: str, device_id: str, start_time: Optiona
         elif end_time:
             key_condition = key_condition & Key('timestamp').lte(end_time)
 
-        # Prepare query parameters
         query_params = {
             'IndexName': GSI_NAME,
             'KeyConditionExpression': key_condition
         }
 
-        # Build filter expression for device_id and optional status
+        # device_idとstatusはFilterExpressionで適用
         filter_expressions = [Attr('device_id').eq(device_id)]
         if status:
             filter_expressions.append(Attr('device_status').eq(status))
 
-        # Combine filter expressions with AND logic
         if len(filter_expressions) == 1:
             query_params['FilterExpression'] = filter_expressions[0]
         else:
@@ -219,15 +231,15 @@ def query_room_device_specific(room_id: str, device_id: str, start_time: Optiona
 
 def query_device_room_info(device_id: str) -> List[str]:
     """
-    Get all unique room IDs where a specific device has been deployed
-    Uses device partition key query with room_id projection
+    特定デバイスが配置されている全部屋IDを取得
+    room_idのみプロジェクションして通信量を削減
     """
     try:
         response = table.query(
             KeyConditionExpression=Key('device_id').eq(device_id),
-            ProjectionExpression='room_id'  # Only fetch room_id attribute
+            ProjectionExpression='room_id'
         )
-        # Extract unique room IDs for this device
+        # setで重複除去してからソート
         rooms = set(item['room_id'] for item in response.get('Items', []))
         return sorted(list(rooms))
     except Exception as e:
@@ -237,14 +249,12 @@ def query_device_room_info(device_id: str) -> List[str]:
 def query_device_in_specific_room(device_id: str, room_id: str, start_time: Optional[str] = None,
                                   end_time: Optional[str] = None, status: Optional[str] = None) -> List[Dict]:
     """
-    Query specific device in specific room - optimized version using device partition key
-    More efficient than GSI approach for device-centric queries
+    device_id（パーティションキー）でクエリ後、room_idでフィルタ
+    デバイス中心のクエリではGSIより効率的
     """
     try:
-        # Use device partition key for optimal performance
         key_condition = Key('device_id').eq(device_id)
 
-        # Add timestamp filtering
         if start_time and end_time:
             key_condition = key_condition & Key('timestamp').between(start_time, end_time)
         elif start_time:
@@ -252,15 +262,13 @@ def query_device_in_specific_room(device_id: str, room_id: str, start_time: Opti
         elif end_time:
             key_condition = key_condition & Key('timestamp').lte(end_time)
 
-        # Prepare query parameters
         query_params = {'KeyConditionExpression': key_condition}
 
-        # Build filter expression for room_id and optional status
+        # room_idとstatusをFilterExpressionで適用
         filter_expressions = [Attr('room_id').eq(room_id)]
         if status:
             filter_expressions.append(Attr('device_status').eq(status))
 
-        # Combine filter expressions with AND logic
         if len(filter_expressions) == 1:
             query_params['FilterExpression'] = filter_expressions[0]
         else:
@@ -274,14 +282,12 @@ def query_device_in_specific_room(device_id: str, room_id: str, start_time: Opti
 
 def get_unique_rooms() -> List[str]:
     """
-    Scan table to get all unique room IDs
-    Uses projection to minimize data transfer
+    全ユニーク部屋IDを取得 - room_idのみプロジェクションして通信量削減
     """
     try:
         response = table.scan(
-            ProjectionExpression='room_id'  # Only fetch room_id attribute
+            ProjectionExpression='room_id'
         )
-        # Use set to eliminate duplicates, then sort for consistent output
         rooms = set(item['room_id'] for item in response.get('Items', []))
         return sorted(list(rooms))
     except Exception as e:
@@ -290,14 +296,12 @@ def get_unique_rooms() -> List[str]:
 
 def get_unique_devices() -> List[str]:
     """
-    Scan table to get all unique device IDs
-    Uses projection to minimize data transfer
+    全ユニークデバイスIDを取得 - device_idのみプロジェクションして通信量削減
     """
     try:
         response = table.scan(
-            ProjectionExpression='device_id'  # Only fetch device_id attribute
+            ProjectionExpression='device_id'
         )
-        # Use set to eliminate duplicates, then sort for consistent output
         devices = set(item['device_id'] for item in response.get('Items', []))
         return sorted(list(devices))
     except Exception as e:
@@ -306,16 +310,15 @@ def get_unique_devices() -> List[str]:
 
 def get_devices_in_room(room_id: str) -> List[Dict]:
     """
-    Get all unique devices present in a specific room
-    Uses GSI with projection to optimize query performance
+    特定部屋の全ユニークデバイスを取得
+    GSIでroom_idクエリ、device_idのみプロジェクション
     """
     try:
         response = table.query(
             IndexName=GSI_NAME,
             KeyConditionExpression=Key('room_id').eq(room_id),
-            ProjectionExpression='device_id'  # Only fetch device_id
+            ProjectionExpression='device_id'
         )
-        # Extract unique device IDs and format as objects
         devices = set(item['device_id'] for item in response.get('Items', []))
         return [{'device_id': device} for device in sorted(devices)]
     except Exception as e:
@@ -323,13 +326,13 @@ def get_devices_in_room(room_id: str) -> List[Dict]:
 
 
 # ============================================================================
-# RESPONSE FORMATTING FUNCTIONS - Pure functions for data transformation
+# レスポンス整形関数
 # ============================================================================
 
 def decimal_to_float(obj):
     """
-    Recursively convert DynamoDB Decimal objects to float for JSON serialization
-    DynamoDB returns numbers as Decimal type which isn't JSON serializable
+    DynamoDB Decimalオブジェクトをfloatに再帰変換
+    DynamoDBの数値はDecimal型でJSON直列化できないため
     """
     if isinstance(obj, Decimal):
         return float(obj)
@@ -342,31 +345,28 @@ def decimal_to_float(obj):
 
 def create_response(status_code: int, body: Any, headers: Optional[Dict] = None) -> Dict:
     """
-    Create standardized API Gateway response with CORS headers
-    Ensures consistent response format across all endpoints
+    API Gateway標準レスポンス形式を作成、CORSヘッダー付き
     """
     default_headers = {
         'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',  # Enable CORS for web clients
+        'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization'
     }
 
-    # Merge custom headers if provided
     if headers:
         default_headers.update(headers)
 
     return {
         'statusCode': status_code,
         'headers': default_headers,
-        'body': json.dumps(decimal_to_float(body))  # Convert Decimals and serialize
+        'body': json.dumps(decimal_to_float(body))  # Decimal変換してJSON化
     }
 
 
 def create_error_response(status_code: int, message: str, errors: Optional[List] = None) -> Dict:
     """
-    Create standardized error response with optional detailed error list
-    Provides consistent error format for client error handling
+    標準エラーレスポンス作成、詳細エラーリスト付き
     """
     error_body = {'error': message}
     if errors:
@@ -376,14 +376,11 @@ def create_error_response(status_code: int, message: str, errors: Optional[List]
 
 
 # ============================================================================
-# ROUTE HANDLERS - Individual endpoint logic
+# ルートハンドラー
 # ============================================================================
 
 def handle_root(event: Dict) -> Dict:
-    """
-    Handle GET / - return all telemetry data from table
-    WARNING: This can be expensive for large datasets
-    """
+    """GET / - 全テレメトリーデータ取得（大量データでは高コスト）"""
     try:
         data = query_all_devices()
         return create_response(200, {'data': data, 'count': len(data)})
@@ -392,10 +389,7 @@ def handle_root(event: Dict) -> Dict:
 
 
 def handle_devices_list(event: Dict) -> Dict:
-    """
-    Handle GET /devices - return list of all unique device IDs
-    Useful for discovering available devices in the system
-    """
+    """GET /devices - 全ユニークデバイスIDリスト取得"""
     try:
         devices = get_unique_devices()
         return create_response(200, {'devices': devices, 'count': len(devices)})
@@ -404,29 +398,25 @@ def handle_devices_list(event: Dict) -> Dict:
 
 
 def handle_device_detail(event: Dict) -> Dict:
-    """
-    Handle GET /devices/{device_id} - return specific device telemetry data
-    Supports optional query parameters for filtering
-    """
-    # Extract parameters from API Gateway event
+    """GET /devices/{device_id} - 特定デバイスのテレメトリーデータ取得"""
     path_params = extract_path_params(event)
     query_params = extract_query_params(event)
 
     device_id = path_params.get('device_id')
 
-    # Validate required path parameter
+    # パスパラメータ検証
     validators = {'device_id': validate_device_id}
     is_valid, errors = validate_params({'device_id': device_id}, validators)
 
     if not is_valid:
         return create_error_response(400, "Validation failed", errors)
 
-    # Extract optional query parameters
+    # クエリパラメータ抽出
     start_time = query_params.get('start_time')
     end_time = query_params.get('end_time')
     status = query_params.get('status')
 
-    # Validate optional query parameters
+    # クエリパラメータ検証
     optional_validators = {
         'start_time': validate_timestamp,
         'end_time': validate_timestamp,
@@ -440,7 +430,6 @@ def handle_device_detail(event: Dict) -> Dict:
         return create_error_response(400, "Query parameter validation failed", errors)
 
     try:
-        # Execute database query with filters
         data = query_device_by_id(device_id, start_time, end_time, status)
         return create_response(200, {'device_id': device_id, 'data': data, 'count': len(data)})
     except Exception as e:
@@ -448,14 +437,10 @@ def handle_device_detail(event: Dict) -> Dict:
 
 
 def handle_device_rooms(event: Dict) -> Dict:
-    """
-    Handle GET /devices/{device_id}/rooms - return all rooms where device has been deployed
-    Provides room deployment history for a specific device
-    """
+    """GET /devices/{device_id}/rooms - デバイスが配置されている全部屋取得"""
     path_params = extract_path_params(event)
     device_id = path_params.get('device_id')
 
-    # Validate required path parameter
     validators = {'device_id': validate_device_id}
     is_valid, errors = validate_params({'device_id': device_id}, validators)
 
@@ -463,7 +448,6 @@ def handle_device_rooms(event: Dict) -> Dict:
         return create_error_response(400, "Validation failed", errors)
 
     try:
-        # Get all rooms where this device has been deployed
         rooms = query_device_room_info(device_id)
         return create_response(200, {
             'device_id': device_id,
@@ -475,18 +459,13 @@ def handle_device_rooms(event: Dict) -> Dict:
 
 
 def handle_device_room_detail(event: Dict) -> Dict:
-    """
-    Handle GET /devices/{device_id}/{room_id} - return specific device data in specific room
-    Device-centric approach for querying device performance in specific room
-    """
-    # Extract parameters from API Gateway event
+    """GET /devices/{device_id}/{room_id} - 特定デバイスの特定部屋データ取得"""
     path_params = extract_path_params(event)
     query_params = extract_query_params(event)
 
     device_id = path_params.get('device_id')
     room_id = path_params.get('room_id')
 
-    # Validate required path parameters
     validators = {
         'device_id': validate_device_id,
         'room_id': validate_room_id
@@ -496,12 +475,10 @@ def handle_device_room_detail(event: Dict) -> Dict:
     if not is_valid:
         return create_error_response(400, "Validation failed", errors)
 
-    # Extract optional query parameters
     start_time = query_params.get('start_time')
     end_time = query_params.get('end_time')
     status = query_params.get('status')
 
-    # Validate optional query parameters
     optional_validators = {
         'start_time': validate_timestamp,
         'end_time': validate_timestamp,
@@ -515,7 +492,7 @@ def handle_device_room_detail(event: Dict) -> Dict:
         return create_error_response(400, "Query parameter validation failed", errors)
 
     try:
-        # Execute device-room specific query (optimized for device partition key)
+        # デバイスパーティションキー使用で効率的
         data = query_device_in_specific_room(device_id, room_id, start_time, end_time, status)
         return create_response(200, {
             'device_id': device_id,
@@ -528,10 +505,7 @@ def handle_device_room_detail(event: Dict) -> Dict:
 
 
 def handle_rooms_list(event: Dict) -> Dict:
-    """
-    Handle GET /rooms - return list of all unique room IDs
-    Useful for discovering available rooms in the system
-    """
+    """GET /rooms - 全ユニーク部屋IDリスト取得"""
     try:
         rooms = get_unique_rooms()
         return create_response(200, {'rooms': rooms, 'count': len(rooms)})
@@ -540,28 +514,21 @@ def handle_rooms_list(event: Dict) -> Dict:
 
 
 def handle_room_detail(event: Dict) -> Dict:
-    """
-    Handle GET /rooms/{room_id} - return all telemetry data for devices in specific room
-    Uses GSI for efficient room-based queries
-    """
-    # Extract parameters from API Gateway event
+    """GET /rooms/{room_id} - 特定部屋の全デバイステレメトリーデータ取得"""
     path_params = extract_path_params(event)
     query_params = extract_query_params(event)
 
     room_id = path_params.get('room_id')
 
-    # Validate required path parameter
     validators = {'room_id': validate_room_id}
     is_valid, errors = validate_params({'room_id': room_id}, validators)
 
     if not is_valid:
         return create_error_response(400, "Validation failed", errors)
 
-    # Extract optional query parameters
     start_time = query_params.get('start_time')
     end_time = query_params.get('end_time')
 
-    # Validate optional query parameters
     optional_validators = {
         'start_time': validate_timestamp,
         'end_time': validate_timestamp
@@ -574,7 +541,7 @@ def handle_room_detail(event: Dict) -> Dict:
         return create_error_response(400, "Query parameter validation failed", errors)
 
     try:
-        # Execute GSI query for room data
+        # GSI使用で部屋ベースクエリ
         data = query_room_by_id(room_id, start_time, end_time)
         return create_response(200, {'room_id': room_id, 'data': data, 'count': len(data)})
     except Exception as e:
@@ -582,14 +549,10 @@ def handle_room_detail(event: Dict) -> Dict:
 
 
 def handle_room_devices(event: Dict) -> Dict:
-    """
-    Handle GET /rooms/{room_id}/devices - return list of unique devices in specific room
-    Provides device inventory for a room
-    """
+    """GET /rooms/{room_id}/devices - 特定部屋のユニークデバイスリスト取得"""
     path_params = extract_path_params(event)
     room_id = path_params.get('room_id')
 
-    # Validate required path parameter
     validators = {'room_id': validate_room_id}
     is_valid, errors = validate_params({'room_id': room_id}, validators)
 
@@ -597,7 +560,6 @@ def handle_room_devices(event: Dict) -> Dict:
         return create_error_response(400, "Validation failed", errors)
 
     try:
-        # Get unique devices in the specified room
         devices = get_devices_in_room(room_id)
         return create_response(200, {'room_id': room_id, 'devices': devices, 'count': len(devices)})
     except Exception as e:
@@ -605,18 +567,13 @@ def handle_room_devices(event: Dict) -> Dict:
 
 
 def handle_room_device_detail(event: Dict) -> Dict:
-    """
-    Handle GET /rooms/{room_id}/{device_id} - return specific device data in specific room
-    Room-centric approach for querying device performance in room context
-    """
-    # Extract parameters from API Gateway event
+    """GET /rooms/{room_id}/{device_id} - 特定部屋の特定デバイスデータ取得"""
     path_params = extract_path_params(event)
     query_params = extract_query_params(event)
 
     room_id = path_params.get('room_id')
     device_id = path_params.get('device_id')
 
-    # Validate required path parameters
     validators = {
         'room_id': validate_room_id,
         'device_id': validate_device_id
@@ -626,12 +583,10 @@ def handle_room_device_detail(event: Dict) -> Dict:
     if not is_valid:
         return create_error_response(400, "Validation failed", errors)
 
-    # Extract optional query parameters
     start_time = query_params.get('start_time')
     end_time = query_params.get('end_time')
     status = query_params.get('status')
 
-    # Validate optional query parameters
     optional_validators = {
         'start_time': validate_timestamp,
         'end_time': validate_timestamp,
@@ -645,7 +600,7 @@ def handle_room_device_detail(event: Dict) -> Dict:
         return create_error_response(400, "Query parameter validation failed", errors)
 
     try:
-        # Execute room-device specific query using GSI approach
+        # GSI使用で部屋ベースクエリ
         data = query_room_device_specific(room_id, device_id, start_time, end_time, status)
         return create_response(200, {
             'room_id': room_id,
@@ -658,43 +613,38 @@ def handle_room_device_detail(event: Dict) -> Dict:
 
 
 # ============================================================================
-# ROUTING CONFIGURATION - Maps HTTP method + resource path to handlers
+# ルーティング設定
 # ============================================================================
 
 ROUTE_HANDLERS = {
     ('GET', '/'): handle_root,
     ('GET', '/devices'): handle_devices_list,
     ('GET', '/devices/{device_id}'): handle_device_detail,
-    ('GET', '/devices/{device_id}/rooms'): handle_device_rooms,  # NEW: Device room list
-    ('GET', '/devices/{device_id}/{room_id}'): handle_device_room_detail,  # NEW: Device-centric room query
+    ('GET', '/devices/{device_id}/rooms'): handle_device_rooms,
+    ('GET', '/devices/{device_id}/{room_id}'): handle_device_room_detail,
     ('GET', '/rooms'): handle_rooms_list,
     ('GET', '/rooms/{room_id}'): handle_room_detail,
     ('GET', '/rooms/{room_id}/devices'): handle_room_devices,
-    ('GET', '/rooms/{room_id}/{device_id}'): handle_room_device_detail,  # Room-centric device query
+    ('GET', '/rooms/{room_id}/{device_id}'): handle_room_device_detail,
 }
 
 
 def handler(event: Dict, context: Any) -> Dict:
     """
-    Main Lambda handler with functional routing
-    Processes API Gateway events and routes to appropriate handlers
+    メインLambdaハンドラー - API Gatewayイベントを適切なハンドラーにルーティング
     """
     try:
-        # Extract HTTP method and resource path from API Gateway event
         http_method = event.get('httpMethod', 'GET')
         resource_path = event.get('resource', '/')
 
-        # Route resolution using tuple key lookup
+        # ルート解決
         route_key = (http_method, resource_path)
         route_handler = ROUTE_HANDLERS.get(route_key)
 
-        # Handle unknown routes
         if not route_handler:
             return create_error_response(404, f"Route not found: {http_method} {resource_path}")
 
-        # Execute appropriate handler function
         return route_handler(event)
 
     except Exception as e:
-        # Catch-all error handler for unexpected failures
         return create_error_response(500, f"Internal server error: {str(e)}")
