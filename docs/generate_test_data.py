@@ -60,6 +60,48 @@ def convert_dynamodb_to_normal_format(dynamodb_data: List[Dict[str, Any]]) -> Li
     return normal_data
 
 
+def generate_device_error_patterns(devices: List[str], data_points_per_device: int, error_rate: float) -> Dict[
+    str, List[bool]]:
+    """
+    各デバイスに対して個別にエラーパターンを生成
+
+    Args:
+        devices: デバイスIDのリスト
+        data_points_per_device: デバイスあたりのデータポイント数
+        error_rate: エラー率 (0.0-1.0)
+
+    Returns:
+        Dict[str, List[bool]]: デバイスIDをキーとするエラーパターン辞書
+    """
+    print(f"デバイス別エラーパターン生成中...")
+    print(f"  - デバイス数: {len(devices)}")
+    print(f"  - デバイスあたりデータポイント数: {data_points_per_device}")
+    print(f"  - エラー率: {error_rate * 100}%")
+
+    device_error_patterns = {}
+
+    for device in devices:
+        # 各デバイスの正確なエラー数を計算
+        error_count = int(data_points_per_device * error_rate)
+        normal_count = data_points_per_device - error_count
+
+        # エラーパターンを作成
+        error_pattern = [True] * error_count + [False] * normal_count
+
+        # パターンをシャッフルしてランダム性を保持
+        random.shuffle(error_pattern)
+
+        device_error_patterns[device] = error_pattern
+
+        # デバイス別エラー率確認
+        actual_error_rate = sum(error_pattern) / len(error_pattern)
+        if len(devices) <= 10:  # デバイス数が少ない場合のみ詳細表示
+            print(f"    {device}: {error_count}/{data_points_per_device} エラー ({actual_error_rate * 100:.1f}%)")
+
+    print(f"  - 全デバイスのエラーパターン生成完了")
+    return device_error_patterns
+
+
 def generate_test_data() -> List[Dict[str, Any]]:
     """
     API仕様に基づくテストデータ生成
@@ -68,7 +110,7 @@ def generate_test_data() -> List[Dict[str, Any]]:
     - 設定可能なデータ件数
     - 設定可能なセンサー数・部屋数
     - 各部屋にセンサーを重複なしで配置
-    - 設定可能なエラー率
+    - 各デバイスが個別に正確なエラー率を持つ
     - sensor_errorの場合、temperatureはnull
     - 設定可能な開始時刻
     - 1秒間隔でインクリメント
@@ -82,6 +124,12 @@ def generate_test_data() -> List[Dict[str, Any]]:
     print(f"  - エラー率: {ERROR_RATE * 100}%")
     print(f"  - 開始時刻: {START_TIME}")
     print(f"  - DynamoDBテーブル名: {DYNAMODB_TABLE_NAME}")
+
+    # 総データポイント数を計算
+    total_data_points = NUM_ROOMS * DATA_POINTS_PER_ROOM
+    data_points_per_device = DATA_POINTS_PER_ROOM // SENSORS_PER_ROOM
+    print(f"  - 総データポイント数: {total_data_points}")
+    print(f"  - デバイスあたりデータポイント数: {data_points_per_device}")
 
     # センサーとルームのリスト生成（API仕様に合わせた命名）
     sensors = [f"sensor_{i:02d}" for i in range(1, NUM_SENSORS + 1)]
@@ -105,11 +153,17 @@ def generate_test_data() -> List[Dict[str, Any]]:
         room_sensor_mapping[room] = room_sensors
         print(f"  {room}: {len(room_sensors)}個のセンサーを配置")
 
+    # 各デバイスのエラーパターンを事前に生成
+    device_error_patterns = generate_device_error_patterns(sensors, data_points_per_device, ERROR_RATE)
+
     # テストデータ生成
     print("テストデータ生成中...")
     test_data = []
     current_timestamp = START_TIME
     total_generated = 0
+
+    # デバイス別データポイントカウンター
+    device_data_counters = {device: 0 for device in sensors}
 
     for room_idx, room in enumerate(rooms):
         print(f"  部屋 {room} ({room_idx + 1}/{len(rooms)}) のデータ生成中...")
@@ -127,8 +181,10 @@ def generate_test_data() -> List[Dict[str, Any]]:
                 if room_data_count >= DATA_POINTS_PER_ROOM:
                     break
 
-                # エラー率に基づいてステータス決定
-                is_error = random.random() < ERROR_RATE
+                # 該当デバイスのエラーパターンから現在のデータポイントのエラー状態を取得
+                device_data_index = device_data_counters[sensor]
+                is_error = device_error_patterns[sensor][device_data_index]
+                device_data_counters[sensor] += 1
 
                 if is_error:
                     # sensor_errorの場合（temperatureはnull）
@@ -158,6 +214,12 @@ def generate_test_data() -> List[Dict[str, Any]]:
         print(f"    {room}: {room_data_count}件のデータを生成完了")
 
     print(f"データ生成完了: 総計 {total_generated} 件")
+
+    # 最終的なエラー率を確認
+    actual_error_count = sum(1 for item in test_data if item["device_status"]["S"] == "sensor_error")
+    actual_error_rate = actual_error_count / len(test_data)
+    print(f"全体エラー率確認: {actual_error_rate * 100:.2f}% ({actual_error_count}/{len(test_data)})")
+
     return test_data
 
 
@@ -247,8 +309,39 @@ def analyze_test_data(data: List[Dict[str, Any]]):
     print(f"総データ件数: {total_items}")
     print(f"ユニークデバイス数: {len(devices)}")
     print(f"ユニーク部屋数: {len(rooms)}")
-    print(f"正常データ: {ok_count} ({ok_count / total_items * 100:.1f}%)")
-    print(f"エラーデータ: {error_count} ({error_count / total_items * 100:.1f}%)")
+    print(f"正常データ: {ok_count} ({ok_count / total_items * 100:.2f}%)")
+    print(f"エラーデータ: {error_count} ({error_count / total_items * 100:.2f}%)")
+
+    # デバイス別エラー率統計
+    print("  デバイス別統計を計算中...")
+    device_stats = {}
+    for item in data:
+        device = item["device_id"]["S"]
+        if device not in device_stats:
+            device_stats[device] = {"total": 0, "error": 0}
+
+        device_stats[device]["total"] += 1
+        if item["device_status"]["S"] == "sensor_error":
+            device_stats[device]["error"] += 1
+
+    print("\n=== デバイス別エラー率統計 ===")
+    device_error_rates = []
+    for device, stats in sorted(device_stats.items()):
+        error_rate = stats["error"] / stats["total"] * 100
+        device_error_rates.append(error_rate)
+        if len(device_stats) <= 20:  # デバイス数が少ない場合のみ詳細表示
+            print(f"{device}: {stats['total']}件, エラー率{error_rate:.1f}% ({stats['error']}/{stats['total']})")
+
+    # デバイス別エラー率の統計
+    if device_error_rates:
+        avg_error_rate = sum(device_error_rates) / len(device_error_rates)
+        min_error_rate = min(device_error_rates)
+        max_error_rate = max(device_error_rates)
+        print(f"\nデバイス別エラー率統計:")
+        print(f"  - 平均: {avg_error_rate:.2f}%")
+        print(f"  - 最小: {min_error_rate:.2f}%")
+        print(f"  - 最大: {max_error_rate:.2f}%")
+        print(f"  - 期待値: {ERROR_RATE * 100:.2f}%")
 
     # 部屋別統計
     print("  部屋別統計を計算中...")
@@ -294,7 +387,7 @@ def analyze_test_data(data: List[Dict[str, Any]]):
     else:
         print("SUCCESS: 全センサーが単一の部屋にのみ配置されています")
 
-    # 部屋別センサー配置の表示
+    # 部屋別センサー配置の表示（簡略版）
     print("\n=== 部屋別センサー配置 ===")
     room_device_mapping = {}
     for device, rooms_set in device_room_mapping.items():
@@ -305,7 +398,7 @@ def analyze_test_data(data: List[Dict[str, Any]]):
 
     for room in sorted(room_device_mapping.keys()):
         sensors_in_room = sorted(room_device_mapping[room])
-        print(f"{room}: {sensors_in_room}")
+        print(f"{room}: {len(sensors_in_room)}個のセンサー ({sensors_in_room[0]}~{sensors_in_room[-1]})")
 
 
 def compare_data_formats(dynamodb_data: List[Dict[str, Any]], normal_data: List[Dict[str, Any]]):
@@ -376,8 +469,9 @@ def print_configuration():
     print(f"部屋数: {NUM_ROOMS}")
     print(f"部屋あたりセンサー数: {SENSORS_PER_ROOM}")
     print(f"部屋あたりデータポイント数: {DATA_POINTS_PER_ROOM}")
+    print(f"デバイスあたりデータポイント数: {DATA_POINTS_PER_ROOM // SENSORS_PER_ROOM}")
     print(f"総データポイント数: {NUM_ROOMS * DATA_POINTS_PER_ROOM}")
-    print(f"エラー率: {ERROR_RATE * 100}%")
+    print(f"エラー率: {ERROR_RATE * 100}% (各デバイス個別)")
     print(f"開始時刻: {START_TIME}")
     print(f"出力ファイル:")
     for file_type, filename in OUTPUT_FILES.items():
@@ -426,7 +520,7 @@ if __name__ == "__main__":
 
         print(f"\nDynamoDBへのインポートコマンド:")
         print(
-            f"aws dynamodb batch-write-item --request-items file://{OUTPUT_FILES['batch_write_format']} --region ap-northeast-1")
+            f"./batch_write_request.sh")
 
     except Exception as e:
         print(f"ERROR: エラーが発生しました: {str(e)}")
