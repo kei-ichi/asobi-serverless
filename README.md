@@ -49,3 +49,15 @@ docker push [ecr-registry-url]/[container-name]:latest
 ```shell
 docker push 345804926022.dkr.ecr.ap-northeast-1.amazonaws.com/iot-telemetry-lambda:latest
 ```
+
+## Test code
+
+Install `requests` package for Test API code
+
+```shell
+python3 -m venv venv
+source venv/bin/activate
+pip install requests
+
+pip3 install -r requirements.txt
+```
