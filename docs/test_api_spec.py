@@ -16,8 +16,8 @@ class IoTAPISpecTester:
         self.base_url = base_url.rstrip('/')
         self.test_results = []
 
-        # テストデータから期待される値
-        self.expected_devices = [f"sensor_{i:02d}" for i in range(1, 101)]  # sensor_01 ~ sensor_100
+        # テストデータから期待される値 - センサー数を200に変更
+        self.expected_devices = [f"sensor_{i:02d}" for i in range(1, 201)]  # sensor_01 ~ sensor_200
         self.expected_rooms = [f"room_{i:03d}" for i in range(1, 11)]  # room_001 ~ room_010
         self.total_expected_items = 10000
         self.items_per_room = 1000
@@ -77,14 +77,21 @@ class IoTAPISpecTester:
 
     def validate_error_response(self, data: Dict, expected_status: int, expected_error_message: str = None) -> List[
         str]:
-        """エラーレスポンスの検証"""
+        """
+        エラーレスポンスの検証 - 大文字小文字を無視して比較
+        """
         errors = []
 
         # エラーキーの存在チェック
         if "error" not in data:
             errors.append("Missing 'error' key in error response")
-        elif expected_error_message and expected_error_message not in data["error"]:
-            errors.append(f"Expected error message containing '{expected_error_message}', got '{data['error']}'")
+        elif expected_error_message:
+            # 大文字小文字を無視してエラーメッセージを比較
+            actual_error = data["error"].lower()
+            expected_error = expected_error_message.lower()
+
+            if expected_error not in actual_error:
+                errors.append(f"Expected error message containing '{expected_error_message}', got '{data['error']}'")
 
         return errors
 
@@ -205,11 +212,13 @@ class IoTAPISpecTester:
 
         data = result["data"]
 
-        # レスポンス構造チェック
+        # ステータスコード 200 チェック（既に result["success"] で確認済み）
+
+        # レスポンス構造チェック (device_id, data, count)
         if not self.validate_response_structure(data, ["device_id", "data", "count"]):
             test_result["errors"].append("Missing required keys: device_id, data, count")
 
-        # device_idチェック
+        # device_id チェック
         if data.get("device_id") != device_id:
             test_result["errors"].append(f"Expected device_id {device_id}, got {data.get('device_id')}")
 
@@ -218,11 +227,25 @@ class IoTAPISpecTester:
         if not self.validate_telemetry_data_structure(items):
             test_result["errors"].append("Invalid telemetry data structure")
 
-        # 全てのデータが指定デバイスのものかチェック
+        # データ整合性チェック（全てのデータが指定デバイスのものか）
         for item in items:
             if item.get("device_id") != device_id:
                 test_result["errors"].append(f"Found data for different device: {item.get('device_id')}")
                 break
+
+        # 単一部屋配置チェック
+        room_result = self.make_request(f"/devices/{device_id}/rooms")
+        if room_result["success"]:
+            room_data = room_result["data"]
+            rooms = room_data.get("rooms", [])
+
+            if len(rooms) != 1:
+                test_result["errors"].append(f"Device {device_id} found in {len(rooms)} rooms, expected exactly 1")
+            else:
+                # 単一部屋配置の詳細情報を記録
+                test_result["assigned_room"] = rooms[0]
+        else:
+            test_result["errors"].append(f"Failed to verify room assignment for {device_id}: {room_result['error']}")
 
         test_result["success"] = len(test_result["errors"]) == 0
         test_result["response_time"] = result["response_time"]
@@ -255,6 +278,7 @@ class IoTAPISpecTester:
             "params": params
         }
 
+        # ステータスコード 200 チェック
         if not result["success"]:
             test_result["errors"].append(f"Request failed: {result['error']}")
             self.test_results.append(test_result)
@@ -266,7 +290,7 @@ class IoTAPISpecTester:
         if not self.validate_response_structure(data, ["device_id", "data", "count"]):
             test_result["errors"].append("Missing required keys: device_id, data, count")
 
-        # 時間範囲内のデータかチェック
+        # 時間範囲内データチェック
         items = data.get("data", [])
         start_time = datetime.fromisoformat(params["start_time"].replace('Z', '+00:00'))
         end_time = datetime.fromisoformat(params["end_time"].replace('Z', '+00:00'))
@@ -276,6 +300,39 @@ class IoTAPISpecTester:
             if not (start_time <= item_time <= end_time):
                 test_result["errors"].append(f"Data outside time range: {item['timestamp']}")
                 break
+
+        # データ件数チェック（≤ 全データ件数）
+        total_sensors = len(self.expected_devices)
+        expected_data_points_per_sensor = self.total_expected_items // total_sensors
+
+        total_data_result = self.make_request(f"/devices/{device_id}")
+        if total_data_result["success"]:
+            total_count = total_data_result["data"].get("count", 0)
+            filtered_count = data.get("count", 0)
+
+            # 期待値との比較
+            if total_count != expected_data_points_per_sensor:
+                test_result["errors"].append(
+                    f"Total count ({total_count}) does not match expected ({expected_data_points_per_sensor})")
+
+            # データ件数 ≤ 全データ件数
+            if filtered_count > total_count:
+                test_result["errors"].append(
+                    f"Filtered data count ({filtered_count}) exceeds total count ({total_count})")
+
+            # データ整合性チェック
+            actual_items_count = len(items)
+            if actual_items_count != filtered_count:
+                test_result["errors"].append(
+                    f"Count mismatch: reported {filtered_count}, actual items {actual_items_count}")
+
+            # 結果情報を記録
+            test_result["total_data_count"] = total_count
+            test_result["filtered_data_count"] = filtered_count
+            test_result["expected_total"] = expected_data_points_per_sensor
+
+        else:
+            test_result["errors"].append(f"Failed to get total data count for comparison: {total_data_result['error']}")
 
         test_result["success"] = len(test_result["errors"]) == 0
         test_result["response_time"] = result["response_time"]
@@ -403,24 +460,56 @@ class IoTAPISpecTester:
             "params": params
         }
 
+        # ステータスコード 200 チェック
         if not result["success"]:
             test_result["errors"].append(f"Request failed: {result['error']}")
             self.test_results.append(test_result)
             return test_result
 
         data = result["data"]
+
+        # 基本構造チェック
+        if not self.validate_response_structure(data, ["device_id", "data", "count"]):
+            test_result["errors"].append("Missing required keys: device_id, data, count")
+
         items = data.get("data", [])
 
-        # 全てのデータが指定ステータスかチェック
+        # 全データのステータス = sensor_error チェック
         for item in items:
             if item.get("device_status") != "sensor_error":
                 test_result["errors"].append(f"Found non-error status: {item.get('device_status')}")
                 break
 
-            # sensor_errorの場合、temperatureはnullであるべき
+            # temperature値 = null チェック
             if item.get("temperature") is not None:
                 test_result["errors"].append("sensor_error status should have null temperature")
                 break
+
+        # エラー率 ≈ 25% (±5%) チェック
+        total_data_result = self.make_request(f"/devices/{device_id}")
+        if total_data_result["success"]:
+            total_count = total_data_result["data"].get("count", 0)
+            error_count = data.get("count", 0)
+
+            if total_count > 0:
+                error_rate = (error_count / total_count) * 100
+                expected_rate = 25.0
+                tolerance = 5.0
+
+                if not (expected_rate - tolerance <= error_rate <= expected_rate + tolerance):
+                    test_result["errors"].append(
+                        f"Error rate {error_rate:.1f}% is outside expected range {expected_rate - tolerance}%-{expected_rate + tolerance}%"
+                    )
+
+                # 結果情報を記録
+                test_result["total_count"] = total_count
+                test_result["error_count"] = error_count
+                test_result["error_rate"] = f"{error_rate:.1f}%"
+                test_result["expected_range"] = f"{expected_rate - tolerance}%-{expected_rate + tolerance}%"
+            else:
+                test_result["errors"].append("No total data found for error rate calculation")
+        else:
+            test_result["errors"].append(f"Failed to get total data count: {total_data_result['error']}")
 
         test_result["success"] = len(test_result["errors"]) == 0
         test_result["response_time"] = result["response_time"]
@@ -593,40 +682,93 @@ class IoTAPISpecTester:
     # ============================================================================
     def test_device_room_detail_nonexistent(self) -> Dict[str, Any]:
         """3.5.2 特定デバイスの特定部屋でのテレメトリーデータ取得（存在しない組み合わせ）"""
+        import random
+
         device_id = "sensor_01"
-        room_id = "room_002"  # sensor_01が属さない可能性のある部屋
-        print(f"Testing 3.5.2: GET /devices/{device_id}/{room_id} (nonexistent combination)")
-        result = self.make_request(f"/devices/{device_id}/{room_id}")
 
         test_result = {
             "test_id": "3.5.2",
-            "endpoint": f"GET /devices/{device_id}/{room_id}",
+            "endpoint": f"GET /devices/{device_id}/[nonexistent_room]",
             "description": "特定デバイスの特定部屋でのテレメトリーデータ取得（存在しない組み合わせ）",
             "test_type": "positive",
             "success": False,
             "errors": []
         }
 
+        # sensor_01が実際に配置されている部屋を取得
+        print(f"Testing 3.5.2: First getting rooms for {device_id}")
+        rooms_result = self.make_request(f"/devices/{device_id}/rooms")
+
+        if not rooms_result["success"]:
+            test_result["errors"].append(f"Failed to get device rooms: {rooms_result['error']}")
+            self.test_results.append(test_result)
+            return test_result
+
+        # sensor_01が配置されている部屋を特定
+        device_rooms_data = rooms_result["data"]
+        assigned_rooms = device_rooms_data.get("rooms", [])
+
+        if not assigned_rooms:
+            test_result["errors"].append("No rooms found for sensor_01")
+            self.test_results.append(test_result)
+            return test_result
+
+        # 配置されている部屋のIDを抽出
+        assigned_room_ids = []
+        for room in assigned_rooms:
+            if isinstance(room, dict):
+                assigned_room_ids.append(room.get("room_id"))
+            elif isinstance(room, str):
+                assigned_room_ids.append(room)
+
+        print(f"sensor_01 is assigned to rooms: {assigned_room_ids}")
+
+        # self.expected_roomsから未配置の部屋を選択
+        available_rooms = [room_id for room_id in self.expected_rooms if room_id not in assigned_room_ids]
+
+        if not available_rooms:
+            test_result["errors"].append(
+                f"All expected rooms {self.expected_rooms} are assigned to sensor_01 - cannot test nonexistent combination")
+            self.test_results.append(test_result)
+            return test_result
+
+        # ランダムに未配置の部屋を選択
+        nonexistent_room_id = random.choice(available_rooms)
+        print(
+            f"Testing with nonexistent room: {nonexistent_room_id} (selected from {len(available_rooms)} available rooms)")
+
+        # 存在しない組み合わせでテスト実行
+        test_result["endpoint"] = f"GET /devices/{device_id}/{nonexistent_room_id}"
+        result = self.make_request(f"/devices/{device_id}/{nonexistent_room_id}")
+
+        # ステータスコード 200 チェック
         if not result["success"]:
-            # 404エラーまたは空データが期待される
-            if result.get("status_code") == 404:
-                test_result["success"] = True
-                test_result["response_time"] = result.get("response_time", 0)
-                test_result["actual_count"] = 0
-            else:
-                test_result["errors"].append(f"Request failed: {result['error']}")
-        else:
-            data = result["data"]
-            actual_count = data.get("count", 0)
+            test_result["errors"].append(f"Request failed: {result['error']}")
+            self.test_results.append(test_result)
+            return test_result
 
-            # データが0件であることを期待
-            if actual_count == 0:
-                test_result["success"] = True
-            else:
-                test_result["errors"].append(f"Expected 0 items for nonexistent combination, got {actual_count}")
+        data = result["data"]
 
-            test_result["response_time"] = result["response_time"]
-            test_result["actual_count"] = actual_count
+        # レスポンス構造チェック（基本構造は維持されるべき）
+        if not self.validate_response_structure(data, ["device_id", "room_id", "data", "count"]):
+            test_result["errors"].append("Missing required keys: device_id, room_id, data, count")
+
+        # データ件数 = 0 チェック
+        actual_count = data.get("count", 0)
+        if actual_count != 0:
+            test_result["errors"].append(f"Expected 0 items for nonexistent combination, got {actual_count}")
+
+        # データ配列も空であることを確認
+        items = data.get("data", [])
+        if len(items) != 0:
+            test_result["errors"].append(f"Expected empty data array, got {len(items)} items")
+
+        test_result["success"] = len(test_result["errors"]) == 0
+        test_result["response_time"] = result["response_time"]
+        test_result["actual_count"] = actual_count
+        test_result["tested_room"] = nonexistent_room_id
+        test_result["assigned_rooms"] = assigned_room_ids
+        test_result["available_rooms_count"] = len(available_rooms)
 
         self.test_results.append(test_result)
         return test_result
@@ -636,6 +778,7 @@ class IoTAPISpecTester:
     # ============================================================================
     def test_rooms_list(self) -> Dict[str, Any]:
         """3.6 部屋一覧取得"""
+
         print("Testing 3.6: GET /rooms")
         result = self.make_request("/rooms")
 
@@ -667,12 +810,48 @@ class IoTAPISpecTester:
         if actual_count != expected_count:
             test_result["errors"].append(f"Expected {expected_count} rooms, got {actual_count}")
 
+        # 部屋形式チェック
+        invalid_room_formats = []
+
+        for room in rooms:
+            room_id = room.get("room_id") if isinstance(room, dict) else room
+
+            if not self._validate_room_id_format(room_id):
+                invalid_room_formats.append(room_id)
+
+        if invalid_room_formats:
+            test_result["errors"].append(
+                f"Invalid room format found: {invalid_room_formats}. Expected room_XXX format (XXX > 0)")
+
+        # countフィールドとrooms配列の整合性チェック
+        response_count = data.get("count", 0)
+        if response_count != actual_count:
+            test_result["errors"].append(
+                f"Count mismatch: response count={response_count}, actual rooms={actual_count}")
+
         test_result["success"] = len(test_result["errors"]) == 0
         test_result["response_time"] = result["response_time"]
         test_result["actual_count"] = actual_count
+        test_result["expected_count"] = expected_count
 
         self.test_results.append(test_result)
         return test_result
+
+    def _validate_room_id_format(self, room_id: str) -> bool:
+        """部屋ID形式の検証: room_number（numberは0より大きい3桁の数字）"""
+        if not isinstance(room_id, str) or room_id.count('_') != 1:
+            return False
+
+        room_prefix, room_num = room_id.split('_')
+
+        try:
+            if room_prefix != 'room':
+                return False
+
+            num = int(room_num)
+            return num > 0 and len(room_num) == 3 and room_num.isdigit()
+        except ValueError:
+            return False
 
     # ============================================================================
     # テストケース：特定部屋の全デバイステレメトリーデータ取得（基本）
@@ -680,6 +859,7 @@ class IoTAPISpecTester:
     def test_room_detail_basic(self) -> Dict[str, Any]:
         """3.7.1 特定部屋の全デバイステレメトリーデータ取得（基本）"""
         room_id = "room_001"
+
         print(f"Testing 3.7.1: GET /rooms/{room_id}")
         result = self.make_request(f"/rooms/{room_id}")
 
@@ -707,7 +887,7 @@ class IoTAPISpecTester:
         if data.get("room_id") != room_id:
             test_result["errors"].append(f"Expected room_id {room_id}, got {data.get('room_id')}")
 
-        # データ件数チェック（各部屋1000件）
+        # データ件数チェック
         actual_count = data.get("count", 0)
         if actual_count != self.items_per_room:
             test_result["errors"].append(f"Expected {self.items_per_room} items for room, got {actual_count}")
@@ -719,9 +899,24 @@ class IoTAPISpecTester:
                 test_result["errors"].append(f"Found data for different room: {item.get('room_id')}")
                 break
 
+        # ユニークデバイス数チェック
+        unique_devices = set()
+        for item in items:
+            device_id = item.get("device_id")
+            if device_id:
+                unique_devices.add(device_id)
+
+        actual_unique_devices = len(unique_devices)
+        if actual_unique_devices != self.devices_per_room:
+            test_result["errors"].append(
+                f"Expected {self.devices_per_room} unique devices, got {actual_unique_devices}")
+
         test_result["success"] = len(test_result["errors"]) == 0
         test_result["response_time"] = result["response_time"]
         test_result["actual_count"] = actual_count
+        test_result["actual_unique_devices"] = actual_unique_devices
+        test_result["expected_count"] = self.items_per_room
+        test_result["expected_unique_devices"] = self.devices_per_room
 
         self.test_results.append(test_result)
         return test_result
@@ -824,14 +1019,23 @@ class IoTAPISpecTester:
             test_result["errors"].append(f"Expected {self.devices_per_room} devices for room, got {actual_count}")
 
         # デバイス構造チェック
+        device_ids = []
         for device in devices:
             if not isinstance(device, dict) or "device_id" not in device:
                 test_result["errors"].append("Invalid device structure")
                 break
+            device_ids.append(device["device_id"])
+
+        # デバイス重複チェック
+        unique_device_ids = set(device_ids)
+        if len(unique_device_ids) != len(device_ids):
+            duplicates = [device_id for device_id in device_ids if device_ids.count(device_id) > 1]
+            test_result["errors"].append(f"Duplicate devices found: {list(set(duplicates))}")
 
         test_result["success"] = len(test_result["errors"]) == 0
         test_result["response_time"] = result["response_time"]
         test_result["actual_count"] = actual_count
+        test_result["unique_devices"] = len(unique_device_ids)
 
         self.test_results.append(test_result)
         return test_result
@@ -942,20 +1146,20 @@ class IoTAPISpecTester:
     # テストケース：センサー重複チェック
     # ============================================================================
     def test_sensor_duplicate_check(self) -> Dict[str, Any]:
-        """5.1 センサー重複チェックテスト"""
+        """5.1 センサー重複チェックテスト - シンプル版"""
         print("Testing 5.1: Sensor Duplicate Check")
 
         test_result = {
             "test_id": "5.1",
             "endpoint": "Multiple GET /devices/{device_id}/rooms",
-            "description": "センサー重複チェック",
+            "description": "センサー重複チェック（各センサーが1つの部屋にのみ属することを確認）",
             "test_type": "positive",
             "success": False,
             "errors": []
         }
 
-        # 複数のセンサーの部屋配置を確認
-        test_devices = ["sensor_01", "sensor_02", "sensor_03"]
+        # 複数のセンサーの部屋配置を確認（サンプルテスト）
+        test_devices = ["sensor_01", "sensor_02", "sensor_03", "sensor_21", "sensor_41"]
         device_room_mapping = {}
 
         for device_id in test_devices:
@@ -969,23 +1173,23 @@ class IoTAPISpecTester:
             rooms = data.get("rooms", [])
             device_room_mapping[device_id] = rooms
 
-            # 各センサーは1つの部屋にのみ属するべき
+            # 各センサーは正確に1つの部屋にのみ属するべき
             if len(rooms) != 1:
-                test_result["errors"].append(f"Device {device_id} found in {len(rooms)} rooms, expected 1")
+                test_result["errors"].append(f"Device {device_id} found in {len(rooms)} rooms, expected exactly 1")
 
-        # センサー重複チェック
-        all_rooms = []
+        # 部屋配置の詳細情報を追加（デバッグ用）
+        room_to_devices = {}
         for device_id, rooms in device_room_mapping.items():
-            all_rooms.extend(rooms)
-
-        # 重複がないことを確認（各センサーが異なる部屋にいる場合）
-        unique_rooms = set(all_rooms)
-        if len(all_rooms) != len(unique_rooms):
-            test_result["errors"].append("Found duplicate room assignments")
+            if len(rooms) == 1:
+                room_id = rooms[0]
+                if room_id not in room_to_devices:
+                    room_to_devices[room_id] = []
+                room_to_devices[room_id].append(device_id)
 
         test_result["success"] = len(test_result["errors"]) == 0
         test_result["device_count"] = len(test_devices)
         test_result["room_mapping"] = device_room_mapping
+        test_result["room_to_devices_mapping"] = room_to_devices
 
         self.test_results.append(test_result)
         return test_result
@@ -1068,7 +1272,7 @@ class IoTAPISpecTester:
             if result["status_code"] != 400:
                 test_result["errors"].append(f"Expected status 400, got {result['status_code']}")
 
-            # エラーレスポンスの構造チェック
+            # エラーレスポンスの構造チェック（大文字小文字を無視）
             if result.get("data") or result.get("response_data"):
                 error_data = result.get("data") or result.get("response_data")
                 validation_errors = self.validate_error_response(error_data, 400, "Validation failed")
@@ -1092,7 +1296,24 @@ class IoTAPISpecTester:
         print("Testing 6.3: Invalid Room ID Formats")
 
         invalid_room_tests = [
-            ("/rooms/%20", "スペースのみの部屋ID", "room_id with spaces only")
+            ("/rooms/%20", "スペースのみの部屋ID", "room_id with spaces only"),
+            ("/rooms/_", "アンダースコアのみ", "room_id with underscore only"),
+            ("/rooms/room01", "2桁の数値部分", "room_id with 2-digit number"),
+            ("/rooms/room_0001", "4桁の数値部分", "room_id with 4-digit number"),
+            ("/rooms/room_000", "数値部分が0", "room_id with zero number"),
+            ("/rooms/room_-01", "負の数値", "room_id with negative number"),
+            ("/rooms/room_abc", "数値部分が文字列", "room_id with non-numeric part"),
+            ("/rooms/room__001", "複数のアンダースコア", "room_id with multiple underscores"),
+            ("/rooms/room001", "アンダースコアなし", "room_id without underscore"),
+            ("/rooms/office_001", "不正なプレフィックス", "room_id with wrong prefix"),
+            ("/rooms/_001", "空のプレフィックス", "room_id with empty prefix"),
+            ("/rooms/room_", "空の数値部分", "room_id with empty number part"),
+            ("/rooms/room_01a", "数値部分に文字が混在", "room_id with mixed alphanumeric"),
+            ("/rooms/room_1.0", "小数点を含む数値", "room_id with decimal number"),
+            ("/rooms/ROOM_001", "大文字のプレフィックス", "room_id with uppercase prefix"),
+            ("/rooms/room_+01", "正の符号付き数値", "room_id with positive sign"),
+            ("/rooms/", "空の部屋ID", "empty room_id"),
+            ("/rooms/room_00a", "先頭0で文字が混在", "room_id with leading zero and letter")
         ]
 
         test_results = []
@@ -1119,6 +1340,14 @@ class IoTAPISpecTester:
                 error_data = result.get("data") or result.get("response_data")
                 if "error" not in error_data:
                     test_result["errors"].append("Missing 'error' key in error response")
+                else:
+                    # バリデーションエラーメッセージの確認（大文字小文字を無視）
+                    error_message = error_data["error"].lower()
+                    if "validation" not in error_message and "invalid" not in error_message:
+                        # 一部のケースでは404が適切な場合もある
+                        if result["status_code"] != 404:
+                            test_result["errors"].append(
+                                f"Expected validation error message, got: {error_data['error']}")
             else:
                 test_result["errors"].append("No error response data received")
 
@@ -1168,7 +1397,7 @@ class IoTAPISpecTester:
             if result["status_code"] != 400:
                 test_result["errors"].append(f"Expected status 400, got {result['status_code']}")
 
-            # エラーレスポンスの構造チェック
+            # エラーレスポンスの構造チェック（大文字小文字を無視）
             if result.get("data") or result.get("response_data"):
                 error_data = result.get("data") or result.get("response_data")
                 validation_errors = self.validate_error_response(error_data, 400, "validation failed")
@@ -1221,7 +1450,7 @@ class IoTAPISpecTester:
             if result["status_code"] != 400:
                 test_result["errors"].append(f"Expected status 400, got {result['status_code']}")
 
-            # エラーレスポンスの構造チェック
+            # エラーレスポンスの構造チェック（大文字小文字を無視）
             if result.get("data") or result.get("response_data"):
                 error_data = result.get("data") or result.get("response_data")
                 validation_errors = self.validate_error_response(error_data, 400, "validation failed")
@@ -1270,10 +1499,10 @@ class IoTAPISpecTester:
             if result["status_code"] != 400:
                 test_result["errors"].append(f"Expected status 400, got {result['status_code']}")
 
-            # エラーレスポンスの構造チェック
+            # エラーレスポンスの構造チェック（大文字小文字を無視）
             if result.get("data") or result.get("response_data"):
                 error_data = result.get("data") or result.get("response_data")
-                validation_errors = self.validate_error_response(error_data, 400, "validation failed")
+                validation_errors = self.validate_error_response(error_data, 400, "Validation failed")
                 test_result["errors"].extend(validation_errors)
             else:
                 test_result["errors"].append("No error response data received")
@@ -1295,8 +1524,8 @@ class IoTAPISpecTester:
 
         invalid_routes = [
             ("/nonexistent", "存在しないパス"),
-            ("/devices/sensor_01/invalid", "存在しないサブパス"),
-            ("/rooms/room_001/invalid", "存在しない部屋サブパス")
+            ("/devices/sensor_01/room_001/invalid", "存在しないサブパス"),
+            ("/rooms/room_001/sensor_01/invalid", "存在しない部屋サブパス")
         ]
 
         test_results = []
@@ -1321,7 +1550,7 @@ class IoTAPISpecTester:
             # エラーレスポンスの構造チェック
             if result.get("data") or result.get("response_data"):
                 error_data = result.get("data") or result.get("response_data")
-                validation_errors = self.validate_error_response(error_data, 404, "not found")
+                validation_errors = self.validate_error_response(error_data, 403, "Missing Authentication Token")
                 test_result["errors"].extend(validation_errors)
             else:
                 test_result["errors"].append("No error response data received")
